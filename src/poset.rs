@@ -1,6 +1,9 @@
 use std::fmt::Debug;
 
-use crate::{bitset::BitSet, constants::MAX_N};
+use crate::{
+    bitset::{BitSet, BitStorage},
+    constants::MAX_N,
+};
 
 pub trait Poset: Sized + Debug {
     fn new(n: u8, i: u8) -> Self;
@@ -67,6 +70,47 @@ pub trait Poset: Sized + Debug {
         }
 
         true
+    }
+
+    /// Export the poset as a DOT graph (Hasse diagram with transitive reduction)
+    fn to_dot(&self) -> String {
+        let mut s = String::new();
+        s.push_str("digraph P {\n");
+        s.push_str("    rankdir=BT;\n"); // Draw bottom-to-top
+        s.push_str("    node [shape=circle style=filled fillcolor=white];\n");
+
+        let n = self.n();
+        // Add nodes
+        for i in 0..n {
+            s.push_str(&format!("    {};\n", i));
+        }
+
+        // Add Hasse edges (Transitive Reduction)
+        for i in 0..n {
+            for j in 0..n {
+                if i == j {
+                    continue;
+                }
+                if self.is_less(i, j) {
+                    // Check if this is a direct edge (no intermediate k)
+                    let mut is_direct = true;
+                    for k in 0..n {
+                        if k == i || k == j {
+                            continue;
+                        }
+                        if self.is_less(i, k) && self.is_less(k, j) {
+                            is_direct = false;
+                            break;
+                        }
+                    }
+                    if is_direct {
+                        s.push_str(&format!("    {} -> {};\n", i, j));
+                    }
+                }
+            }
+        }
+        s.push_str("}\n");
+        s
     }
 
     fn estimate_hardness(&self) -> u32 {
@@ -147,7 +191,6 @@ pub trait Poset: Sized + Debug {
         sum
     }
 
-
     fn weight0(&self) -> u64 {
         debug_assert!(self.is_lower_triangle_matrix());
 
@@ -176,7 +219,6 @@ pub trait Poset: Sized + Debug {
         less_subsets.push(BitSet::empty());
 
         for j in 0..self.n() as usize {
-
             let less_than_j = all_less_than[j];
 
             // try adding j to all previous subsets
@@ -209,8 +251,9 @@ pub trait Poset: Sized + Debug {
                     0u64
                 });
                 let w2 = (if b.len() == (self.i()) as usize {
-                    let a = b.complement()
-                        .intersect(BitSet::from_u16((1u16 << self.n()) - 1));
+                    let a = b
+                        .complement()
+                        .intersect(BitSet::from_storage(((1 as BitStorage) << self.n()) - 1));
                     let mut min_a = a;
                     for j in 0..self.n() as usize {
                         if min_a.contains(j) {
@@ -256,7 +299,6 @@ pub trait Poset: Sized + Debug {
         less_subsets.push(BitSet::empty());
 
         for j in 0..self.n() as usize {
-
             let less_than_j = all_less_than[j];
 
             // try adding j to all previous subsets
@@ -276,8 +318,9 @@ pub trait Poset: Sized + Debug {
         let (w1, w2) = less_subsets
             .iter()
             .map(|b| {
-                let a = b.complement()
-                    .intersect(BitSet::from_u16((1u16 << self.n()) - 1));
+                let a = b
+                    .complement()
+                    .intersect(BitSet::from_storage(((1 as BitStorage) << self.n()) - 1));
                 let mut max_b = *b;
                 for j in 0..self.n() as usize {
                     if max_b.contains(j) {
@@ -292,7 +335,9 @@ pub trait Poset: Sized + Debug {
                 }
                 let w1 = (if b.len() == self.i() as usize {
                     let sqrtn = (max_comparisons as f64).sqrt();
-                    if min_a.len() >= (sqrtn).ceil() as usize && min_a.len() + max_b.len() >= 2 * sqrtn.ceil() as usize {
+                    if min_a.len() >= (sqrtn).ceil() as usize
+                        && min_a.len() + max_b.len() >= 2 * sqrtn.ceil() as usize
+                    {
                         let exp = (min_a.len() + max_b.len()) as u32 - 2 * sqrtn.ceil() as u32;
                         2u128.pow(exp) * scale / (max_b.len() as u128 + 1)
                     } else {
@@ -306,7 +351,9 @@ pub trait Poset: Sized + Debug {
                 });
                 let w2 = (if b.len() == (self.i() + 1) as usize {
                     let sqrtn = (max_comparisons as f64).sqrt();
-                    if max_b.len() >= (sqrtn).ceil() as usize && min_a.len() + max_b.len() >= 2 * sqrtn.ceil() as usize {
+                    if max_b.len() >= (sqrtn).ceil() as usize
+                        && min_a.len() + max_b.len() >= 2 * sqrtn.ceil() as usize
+                    {
                         let exp = (min_a.len() + max_b.len()) as u32 - 2 * sqrtn.ceil() as u32;
                         2u128.pow(exp) * scale / (min_a.len() as u128 + 1)
                     } else {
@@ -413,6 +460,7 @@ mod test {
         let mut poset = FreePoset::new(10, 4);
         poset.add_and_close(0, 1);
         poset.canonify();
+
         // dbg!(poset, poset.num_compatible_posets());
         assert_eq!(poset.num_compatible_posets(), 854); // i don't know if this is correct
 

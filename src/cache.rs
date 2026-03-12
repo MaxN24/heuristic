@@ -27,7 +27,7 @@ struct Entry {
 
 impl Cache {
     pub fn new(max_bytes: usize) -> Self {
-        let len = max_bytes / size_of::<Row>();
+        let len = (max_bytes / size_of::<Row>()).max(1);
         Cache {
             arrays: vec![Row::new(); len].into_boxed_slice(),
             len: 0,

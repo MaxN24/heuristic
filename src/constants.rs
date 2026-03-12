@@ -1,4 +1,4 @@
-pub const MAX_N: usize = 16;
+pub const MAX_N: usize = 32;
 
 pub const KNOWN_VALUES: [&[usize]; 17] = [
     &[0],                              // n = 0
