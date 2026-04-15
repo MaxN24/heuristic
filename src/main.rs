@@ -9,11 +9,13 @@ use pseudo_canonified_poset::PseudoCanonifiedPoset;
 use search_backward::iterative_deepening_backward;
 use search_forward::Cost;
 use std::{
+    fs,
     fs::{DirBuilder, OpenOptions},
     io::{BufWriter, Write},
     path::Path,
     str::FromStr,
     sync::{atomic::AtomicBool, Arc},
+    time::Instant,
 };
 
 use crate::{
@@ -37,6 +39,8 @@ mod pseudo_canonified_poset;
 mod search_backward;
 mod search_forward;
 mod utils;
+
+const HEURISTIC_RESULTS_HEADER: &str = "n,i,total_comparisons,elapsed_seconds";
 
 #[derive(Debug, Clone)]
 pub enum SearchMode {
@@ -167,18 +171,7 @@ fn run_heuristic(args: &Args) {
     println!("Maximum cache entries: {}", cache.max_entries());
 
     DirBuilder::new().recursive(true).create(&log_dir).unwrap();
-
-    if !Path::new(&results_path).exists() {
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&results_path)
-            .unwrap();
-
-        let mut writer = BufWriter::new(file);
-        writeln!(writer, "n,i,total_comparisons").unwrap();
-    }
+    ensure_heuristic_results_file(&results_path);
 
     for n in start_n..=MAX_N as u8 {
         let start_i = if n == start_n { args.i.unwrap_or(0) } else { 0 };
@@ -194,13 +187,17 @@ fn run_heuristic(args: &Args) {
                 args.heuristic_strategy,
             );
 
+            let search_start = Instant::now();
             let result = if args.heuristic_fast {
                 search.search_heuristic_fast()
             } else {
                 search.search_heuristic()
             };
+            let elapsed_seconds = search_start.elapsed().as_secs_f64();
 
-            println!("n: {n}, i: {i}, total comparisons: {result}");
+            println!(
+                "n: {n}, i: {i}, total comparisons: {result}, elapsed seconds: {elapsed_seconds:.6}"
+            );
 
             let file = OpenOptions::new()
                 .create(true)
@@ -209,11 +206,64 @@ fn run_heuristic(args: &Args) {
                 .unwrap();
 
             let mut writer = BufWriter::new(file);
-            writeln!(writer, "{n},{i},{result}").unwrap();
+            writeln!(writer, "{n},{i},{result},{elapsed_seconds:.6}").unwrap();
 
             if args.single {
                 return;
             }
+        }
+    }
+}
+
+fn ensure_heuristic_results_file(results_path: &str) {
+    if !Path::new(results_path).exists() {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(results_path)
+            .unwrap();
+
+        let mut writer = BufWriter::new(file);
+        writeln!(writer, "{HEURISTIC_RESULTS_HEADER}").unwrap();
+        return;
+    }
+
+    let contents = fs::read_to_string(results_path).unwrap();
+    let Some(header) = contents.lines().next() else {
+        let file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(results_path)
+            .unwrap();
+
+        let mut writer = BufWriter::new(file);
+        writeln!(writer, "{HEURISTIC_RESULTS_HEADER}").unwrap();
+        return;
+    };
+
+    if header == HEURISTIC_RESULTS_HEADER {
+        return;
+    }
+
+    assert_eq!(
+        header, "n,i,total_comparisons",
+        "unexpected heuristic results header in {results_path}"
+    );
+
+    let file = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(results_path)
+        .unwrap();
+    let mut writer = BufWriter::new(file);
+    writeln!(writer, "{HEURISTIC_RESULTS_HEADER}").unwrap();
+
+    for line in contents.lines().skip(1) {
+        if line.trim().is_empty() {
+            writeln!(writer).unwrap();
+        } else {
+            writeln!(writer, "{line},").unwrap();
         }
     }
 }

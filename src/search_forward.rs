@@ -12,6 +12,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 use crate::{
     backwards_poset::BackwardsPoset,
+    bitset::BitSet,
     cache::Cache,
     constants::{LOWER_BOUNDS, UPPER_BOUNDS},
     free_poset::FreePoset,
@@ -175,13 +176,13 @@ impl<'a> Search<'a> {
             2 => println!("(Minimizing Total Relations)"),
             3 => println!("(Maximizing Candidates for i-th Smallest)"),
             4 => println!("(Maximizing Two Candidate Pools"),
-            5 => println!("(Maximizing Compatible Triples)"),
+            5 => println!("(Maximizing Compatible Rank Prefixes)"),
             6 => println!("(Total downset-sum"),
             7 => println!("(Always i < j)"),
             _ => println!("(Default/Unknown Strategy)"),
         }
 
-        if (self.heuristic_strategy == 4 || self.heuristic_strategy == 5) && self.i != 2 {
+        if self.heuristic_strategy == 4 && self.i != 2 {
             println!(
                 "Note: strategy {} is specialized for i=2 (3rd smallest); using strategy 3 fallback for i={}",
                 self.heuristic_strategy, self.i
@@ -400,7 +401,9 @@ impl<'a> Search<'a> {
         match self.weight_function {
             WeightFunction::CompatibleSolutions => {
                 let compatible_posets = poset.num_compatible_posets();
-                if compatible_posets == 0 || (max_comparisons as u32) < (compatible_posets - 1).ilog2() + 1 {
+                if compatible_posets == 0
+                    || (max_comparisons as u32) < (compatible_posets - 1).ilog2() + 1
+                {
                     return Some(false);
                 }
             }
@@ -799,10 +802,9 @@ impl<'a> Search<'a> {
                 self.heuristic_maximize_two_candidate_pools(&first, &second, first_is_i_less_j)
             }
             4 => self.heuristic_maximize_candidates(&first, &second, first_is_i_less_j),
-            5 if self.i == 2 => {
-                self.heuristic_maximize_compatible_triples(&first, &second, first_is_i_less_j)
+            5 => {
+                self.heuristic_maximize_compatible_rank_prefixes(&first, &second, first_is_i_less_j)
             }
-            5 => self.heuristic_maximize_candidates(&first, &second, first_is_i_less_j),
             6 => self.heuristic_6_minimize_delta_downset_sum(parent, i, j),
             7 => self.heuristic_7_fixed_i_less_j(),
             _ => true,
@@ -1033,7 +1035,7 @@ impl<'a> Search<'a> {
         (beaten_by_min, unbeaten)
     }
 
-    fn heuristic_maximize_compatible_triples(
+    fn heuristic_maximize_compatible_rank_prefixes(
         &self,
         first: &PseudoCanonifiedPoset,
         second: &PseudoCanonifiedPoset,
@@ -1041,59 +1043,85 @@ impl<'a> Search<'a> {
     ) -> bool {
         let (i_less_j, j_less_i) = self.comparison_outcomes(first, second, first_is_i_less_j);
 
-        let count_ilj = self.count_compatible_triples(i_less_j);
-        let count_jli = self.count_compatible_triples(j_less_i);
+        let count_ilj = self.count_compatible_rank_prefixes(i_less_j);
+        let count_jli = self.count_compatible_rank_prefixes(j_less_i);
 
         count_ilj >= count_jli
     }
 
-    fn count_compatible_triples(&self, poset: &PseudoCanonifiedPoset) -> u32 {
+    fn count_compatible_rank_prefixes(&self, poset: &PseudoCanonifiedPoset) -> u64 {
         let n = poset.n();
-        let mut count = 0u32;
+        let target_len = poset.i() as usize + 1;
 
-        for m in 0..n {
-            if !self.could_be_minimum(poset, m) {
+        if target_len > n as usize {
+            return 0;
+        }
+
+        let (less, _) = poset.calculate_relations();
+        let greater_than: Vec<BitSet> = (0..n)
+            .map(|candidate| poset.get_all_greater_than(candidate))
+            .collect();
+        let mut memo = HashMap::new();
+
+        self.count_compatible_rank_prefixes_rec(
+            BitSet::empty(),
+            target_len,
+            &less[..n as usize],
+            &greater_than,
+            &mut memo,
+        )
+    }
+
+    fn count_compatible_rank_prefixes_rec(
+        &self,
+        chosen: BitSet,
+        target_len: usize,
+        less: &[u8],
+        greater_than: &[BitSet],
+        memo: &mut HashMap<BitSet, u64>,
+    ) -> u64 {
+        if chosen.len() == target_len {
+            return 1;
+        }
+
+        if let Some(&cached) = memo.get(&chosen) {
+            return cached;
+        }
+
+        let rank = chosen.len() as u8;
+        let mut count = 0u64;
+
+        for candidate in 0..less.len() {
+            if chosen.contains(candidate) {
                 continue;
             }
 
-            for s in 0..n {
-                if s == m {
-                    continue;
-                }
-                if !self.could_be_second(poset, m, s) {
-                    continue;
-                }
-
-                for t in 0..n {
-                    if t == m || t == s {
-                        continue;
-                    }
-                    if !self.could_be_third(poset, m, s, t) {
-                        continue;
-                    }
-
-                    count += 1;
-                }
+            if less[candidate] > rank {
+                continue;
             }
+
+            if !greater_than[candidate].intersect(chosen).is_empty() {
+                continue;
+            }
+
+            let mut next_chosen = chosen;
+            next_chosen.insert(candidate);
+            count = count.saturating_add(self.count_compatible_rank_prefixes_rec(
+                next_chosen,
+                target_len,
+                less,
+                greater_than,
+                memo,
+            ));
         }
+
+        memo.insert(chosen, count);
         count
     }
 
     #[inline]
     fn could_be_minimum(&self, poset: &PseudoCanonifiedPoset, m: u8) -> bool {
         poset.get_all_less_than(m).is_empty()
-    }
-
-    #[inline]
-    fn could_be_second(&self, poset: &PseudoCanonifiedPoset, m: u8, s: u8) -> bool {
-        !self.is_less_unordered(poset, s, m) && poset.get_all_less_than(s).len() <= 1
-    }
-
-    #[inline]
-    fn could_be_third(&self, poset: &PseudoCanonifiedPoset, m: u8, s: u8, t: u8) -> bool {
-        !self.is_less_unordered(poset, t, m)
-            && !self.is_less_unordered(poset, t, s)
-            && poset.get_all_less_than(t).len() <= 2
     }
 
     #[inline]
@@ -1249,6 +1277,7 @@ impl Drop for Analytics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::free_poset::FreePoset;
 
     fn run_heuristic(n: u8, i: u8, strategy: u8, fast: bool) -> u8 {
         let mut cache = Cache::new(1 << 20);
@@ -1284,5 +1313,79 @@ mod tests {
                 "mismatch for n={n}, i={i}, strategy={strategy}"
             );
         }
+    }
+
+    fn legacy_count_compatible_triples(search: &Search<'_>, poset: &PseudoCanonifiedPoset) -> u64 {
+        let n = poset.n();
+        let mut count = 0u64;
+
+        for m in 0..n {
+            if !search.could_be_minimum(poset, m) {
+                continue;
+            }
+
+            for s in 0..n {
+                if s == m {
+                    continue;
+                }
+
+                if search.is_less_unordered(poset, s, m) || poset.get_all_less_than(s).len() > 1 {
+                    continue;
+                }
+
+                for t in 0..n {
+                    if t == m || t == s {
+                        continue;
+                    }
+
+                    if search.is_less_unordered(poset, t, m)
+                        || search.is_less_unordered(poset, t, s)
+                        || poset.get_all_less_than(t).len() > 2
+                    {
+                        continue;
+                    }
+
+                    count += 1;
+                }
+            }
+        }
+
+        count
+    }
+
+    #[test]
+    fn compatible_rank_prefix_count_matches_legacy_triples_for_i_2() {
+        let mut cache = Cache::new(1 << 20);
+        let mut algorithm = HashMap::new();
+        let search = Search::new(
+            6,
+            2,
+            &mut cache,
+            &mut algorithm,
+            false,
+            WeightFunction::None,
+            5,
+        );
+
+        let mut poset = FreePoset::new(6, 2);
+        poset.add_and_close(0, 2);
+        poset.add_and_close(1, 4);
+        let poset = poset.canonified();
+
+        assert_eq!(
+            search.count_compatible_rank_prefixes(&poset),
+            legacy_count_compatible_triples(&search, &poset)
+        );
+    }
+
+    #[test]
+    fn heuristic_5_fast_matches_tracked_for_general_i() {
+        let n = 6;
+        let i = 1;
+
+        let fast = run_heuristic(n, i, 5, true);
+        let tracked = run_heuristic(n, i, 5, false);
+
+        assert_eq!(fast, tracked, "mismatch for n={n}, i={i}, strategy=5");
     }
 }

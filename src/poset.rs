@@ -267,7 +267,8 @@ pub trait Poset: Sized + Debug {
                 });
                 (w1, w2)
             })
-            .reduce(|(x1, x2), (y1, y2)| { (x1 + y1, x2 + y2) }).unwrap();
+            .reduce(|(x1, x2), (y1, y2)| (x1 + y1, x2 + y2))
+            .unwrap();
         return w1.max(w2);
     }
 
@@ -367,7 +368,8 @@ pub trait Poset: Sized + Debug {
                 });
                 (w1, w2)
             })
-            .reduce(|(x1, x2), (y1, y2)| { (x1 + y1, x2 + y2) }).unwrap();
+            .reduce(|(x1, x2), (y1, y2)| (x1 + y1, x2 + y2))
+            .unwrap();
         return w1.max(w2);
     }
 }

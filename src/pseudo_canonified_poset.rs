@@ -182,9 +182,6 @@ impl PseudoCanonifiedPoset {
     }
 
     /// Returns comparison pairs with metadata about which poset is which.
-    /// Returns Vec of (first, second, i, j, first_is_i_less_j) where:
-    /// - first_is_i_less_j = true means first = poset with i<j, second = poset with j<i
-    /// - first_is_i_less_j = false means first = poset with j<i, second = poset with i<j
     pub fn get_comparison_pairs(
         &self,
     ) -> Vec<(PseudoCanonifiedPoset, PseudoCanonifiedPoset, u8, u8, bool)> {
