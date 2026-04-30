@@ -10,7 +10,18 @@ use std::{
 use hashbrown::HashMap;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
-use crate::{backwards_poset::BackwardsPoset, cache::Cache, constants::{LOWER_BOUNDS, UPPER_BOUNDS}, free_poset::FreePoset, poset::Poset, pseudo_canonified_poset::PseudoCanonifiedPoset, search_backward::start_search_backward, utils::format_duration, WeightFunction};
+use crate::{
+    backwards_poset::BackwardsPoset,
+    bitset::BitSet,
+    cache::Cache,
+    constants::{LOWER_BOUNDS, UPPER_BOUNDS},
+    free_poset::FreePoset,
+    poset::Poset,
+    pseudo_canonified_poset::PseudoCanonifiedPoset,
+    search_backward::start_search_backward,
+    utils::format_duration,
+    WeightFunction,
+};
 
 pub struct Search<'a> {
     n: u8,
@@ -21,6 +32,7 @@ pub struct Search<'a> {
     comparisons: &'a mut HashMap<PseudoCanonifiedPoset, (u8, u8)>,
     use_bidirectional_search: bool,
     weight_function: WeightFunction,
+    heuristic_strategy: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -62,6 +74,7 @@ impl<'a> Search<'a> {
         comparisons: &'a mut HashMap<PseudoCanonifiedPoset, (u8, u8)>,
         use_bidirectional_search: bool,
         weight_function: WeightFunction,
+        heuristic_strategy: u8,
     ) -> Self {
         Search {
             n,
@@ -72,6 +85,7 @@ impl<'a> Search<'a> {
             comparisons,
             use_bidirectional_search,
             weight_function,
+            heuristic_strategy,
         }
     }
 
@@ -83,6 +97,11 @@ impl<'a> Search<'a> {
             self.analytics.record_miss();
         }
         result
+    }
+
+    #[inline]
+    fn peek_cache(&self, poset: &PseudoCanonifiedPoset) -> Option<Cost> {
+        self.cache.get(poset)
     }
 
     fn insert_cache(&mut self, poset: PseudoCanonifiedPoset, new_cost: Cost) {
@@ -107,6 +126,59 @@ impl<'a> Search<'a> {
             if replaced {
                 self.analytics.record_replace();
             }
+        }
+    }
+
+    fn heuristic_strategy_dir(&self) -> String {
+        format!("logs/heuristic/strategy_{}", self.heuristic_strategy)
+    }
+
+    fn heuristic_tracked_dir(&self) -> String {
+        format!("{}/tracked", self.heuristic_strategy_dir())
+    }
+
+    fn heuristic_run_dir(&self) -> String {
+        format!(
+            "{}/runs/n_{}_i_{}",
+            self.heuristic_tracked_dir(),
+            self.n,
+            self.i
+        )
+    }
+
+    fn ensure_dir(path: &str) {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .create(path)
+            .unwrap();
+    }
+
+    fn print_heuristic_mode_banner(&self, fast: bool) {
+        if fast {
+            println!(
+                "Running Fast Heuristic Search with Strategy {}",
+                self.heuristic_strategy
+            );
+        } else {
+            println!(
+                "Running Heuristic Search with Strategy {}",
+                self.heuristic_strategy
+            );
+        }
+
+        if !matches!(self.weight_function, WeightFunction::None) {
+            println!("Heuristic path mode ignores weight-function pruning.");
+        }
+
+        match self.heuristic_strategy {
+            0 => println!("(Minimizing Transitive Closure  (Product))"),
+            1 => println!("(Minimizing Hasse Edge (Product))"),
+            2 => println!("(Minimizing Total Relations)"),
+            3 => println!("(Maximizing Candidates for i-th Smallest)"),
+            4 => println!("(Maximizing Compatible Rank Prefixes)"),
+            5 => println!("(Total downset-sum)"),
+            6 => println!("(Always i < j)"),
+            _ => println!("(Default/Unknown Strategy)"),
         }
     }
 
@@ -233,7 +305,6 @@ impl<'a> Search<'a> {
                 .read()
                 .expect("cache shouldn't be poisoned");
             if max_comparisons as i8 + 1 <= read_lock.1 {
-                // TODO: idk, ob das passt; oder ohne '+1'?
                 return if let Some(&value) = read_lock.0.get(&poset.to_backward()) {
                     Cost::Solved(value)
                 } else {
@@ -260,7 +331,7 @@ impl<'a> Search<'a> {
         // search all comparisons
         let mut best_comparison = (0, 0);
         let mut current_best = max_comparisons + 1;
-        for (first, second, i, j) in pairs {
+        for (first, second, i, j, _first_is_i_less_j) in pairs {
             self.analytics.update_stats(
                 depth,
                 self.current_max,
@@ -319,11 +390,12 @@ impl<'a> Search<'a> {
         max_comparisons: u8,
         depth: u8,
     ) -> Option<bool> {
-        
         match self.weight_function {
             WeightFunction::CompatibleSolutions => {
                 let compatible_posets = poset.num_compatible_posets();
-                if compatible_posets == 0 || (max_comparisons as u32) < (compatible_posets - 1).ilog2() + 1 {
+                if compatible_posets == 0
+                    || (max_comparisons as u32) < (compatible_posets - 1).ilog2() + 1
+                {
                     return Some(false);
                 }
             }
@@ -343,8 +415,6 @@ impl<'a> Search<'a> {
             }
             WeightFunction::None => {}
         }
-
-        
 
         let (less, greater) = poset.calculate_relations();
 
@@ -390,9 +460,597 @@ impl<'a> Search<'a> {
         None
     }
 
-    /// Print information out the cache, e.g. cache entries, hits, misses etc.
+    pub fn search_heuristic(&mut self) -> u8 {
+        let start = Instant::now();
+
+        self.print_heuristic_mode_banner(false);
+
+        let min = LOWER_BOUNDS[self.n as usize][self.i as usize];
+        let max = UPPER_BOUNDS[self.n as usize][self.i as usize];
+
+        let mut result = max as u8;
+        let mut final_poset = None;
+
+        for current in min.. {
+            let poset = FreePoset::new(self.n, self.i);
+            let current = current as u8;
+            self.current_max = current;
+            self.analytics.set_max_depth(current / 2);
+
+            let (canonified, mapping) = poset.canonified_with_mapping();
+            let (search_result, result_poset) =
+                self.search_heuristic_rec(canonified, poset, mapping, current, 0);
+
+            result = match search_result {
+                Cost::Solved(solved) => {
+                    final_poset = Some(result_poset);
+                    solved
+                }
+                Cost::Minimum(min) => {
+                    self.analytics.multiprogress.clear().unwrap();
+                    println!(
+                        "n: {}, i: {} heuristic path not found within {} comparisons",
+                        self.n, self.i, min
+                    );
+                    println!("{}", format_duration(start));
+
+                    continue;
+                }
+            };
+            break;
+        }
+
+        self.analytics.complete_all();
+
+        println!();
+        println!("Heuristic path found!\n\nn: {}, i: {}", self.n, self.i);
+        println!("Path comparisons: {result}");
+        println!();
+
+        let run_dir = self.heuristic_run_dir();
+        Self::ensure_dir(&run_dir);
+
+        if let Some(poset) = final_poset {
+            let dot_path = format!("{run_dir}/final_poset.dot");
+            std::fs::write(&dot_path, poset.to_dot()).unwrap();
+            println!("Exported final poset to: {dot_path}");
+        }
+
+        self.print_cache();
+        println!("{}", format_duration(start));
+        println!();
+
+        result
+    }
+
+    fn search_heuristic_rec(
+        &mut self,
+        poset: PseudoCanonifiedPoset,
+        full_poset: FreePoset,
+        mapping: Vec<u8>,
+        max_comparisons: u8,
+        depth: u8,
+    ) -> (Cost, FreePoset) {
+        if poset.n() == 1 {
+            return (Cost::Solved(0), full_poset);
+        }
+
+        if max_comparisons == 0 {
+            return (Cost::Minimum(1), full_poset);
+        }
+
+        let pairs = poset.get_comparison_pairs();
+        let n_pairs = pairs.len() as u64;
+
+        self.analytics.inc_length(depth, n_pairs);
+
+        let mut current_best = max_comparisons + 1;
+        let mut best_comparison = (0, 0);
+        let mut best_full_poset = full_poset;
+
+        for &(first, second, i, j, first_is_i_less_j) in &pairs {
+            self.analytics.update_stats(
+                depth,
+                self.current_max,
+                self.cache.len(),
+                self.cache.max_entries(),
+            );
+
+            let choose_i_less_j = self.heuristic_decision(
+                &poset,
+                first,
+                second,
+                i,
+                j,
+                first_is_i_less_j,
+                self.heuristic_strategy,
+            );
+
+            let orig_i = mapping[i as usize];
+            let orig_j = mapping[j as usize];
+
+            let mut next_full_poset = full_poset;
+            if choose_i_less_j {
+                next_full_poset.add_and_close(orig_i, orig_j);
+            } else {
+                next_full_poset.add_and_close(orig_j, orig_i);
+            }
+
+            let (next_canonified, next_mapping) = next_full_poset.canonified_with_mapping();
+            let child_budget = current_best - 2;
+
+            let (result, result_poset) = self.search_heuristic_rec(
+                next_canonified,
+                next_full_poset,
+                next_mapping,
+                child_budget,
+                depth + 1,
+            );
+
+            if !result.is_solved() || result.value() > child_budget {
+                self.analytics.inc(depth, 1);
+                continue;
+            }
+
+            best_comparison = (i, j);
+            current_best = result.value() + 1;
+            best_full_poset = result_poset;
+            self.analytics.inc(depth, 1);
+
+            if current_best <= 1 {
+                break;
+            }
+        }
+
+        let result = if current_best <= max_comparisons {
+            self.comparisons.insert(poset, best_comparison);
+            Cost::Solved(current_best)
+        } else {
+            Cost::Minimum(max_comparisons + 1)
+        };
+
+        self.analytics.inc_complete(depth, n_pairs);
+        self.analytics.record_poset();
+        self.insert_cache(poset, result);
+
+        (result, best_full_poset)
+    }
+
+    /// Fast heuristic search with cache. No history tracking.
+    pub fn search_heuristic_fast(&mut self) -> u8 {
+        let start = Instant::now();
+
+        self.print_heuristic_mode_banner(true);
+
+        let min = LOWER_BOUNDS[self.n as usize][self.i as usize];
+        let max = UPPER_BOUNDS[self.n as usize][self.i as usize];
+
+        let mut result = max as u8;
+
+        for current in min.. {
+            let poset = FreePoset::new(self.n, self.i);
+            let current = current as u8;
+            self.current_max = current;
+            self.analytics.set_max_depth(current / 2);
+
+            let search_result = self.search_heuristic_fast_rec(poset.canonified(), current, 0);
+
+            result = match search_result {
+                Cost::Solved(solved) => solved,
+                Cost::Minimum(min) => {
+                    self.analytics.multiprogress.clear().unwrap();
+                    println!(
+                        "n: {}, i: {} heuristic path not found within {} comparisons (fast)",
+                        self.n, self.i, min
+                    );
+                    println!("{}", format_duration(start));
+
+                    continue;
+                }
+            };
+            break;
+        }
+
+        self.analytics.complete_all();
+
+        println!();
+        println!("Fast heuristic path found!\n\nn: {}, i: {}", self.n, self.i);
+        println!("Path comparisons: {result}");
+        println!();
+
+        self.print_cache();
+        println!("{}", format_duration(start));
+        println!();
+
+        result
+    }
+
+    fn search_heuristic_fast_rec(
+        &mut self,
+        poset: PseudoCanonifiedPoset,
+        max_comparisons: u8,
+        depth: u8,
+    ) -> Cost {
+        if poset.n() == 1 {
+            return Cost::Solved(0);
+        }
+
+        if max_comparisons == 0 {
+            return Cost::Minimum(1);
+        }
+
+        if let Some(cost) = self.search_cache(&poset) {
+            match cost {
+                Cost::Solved(_) => return cost,
+                Cost::Minimum(min) if min > max_comparisons => return cost,
+                Cost::Minimum(_) => {}
+            }
+        }
+
+        let pairs = poset.get_comparison_pairs();
+        let n_pairs = pairs.len() as u64;
+
+        self.analytics.inc_length(depth, n_pairs);
+
+        let mut current_best = max_comparisons + 1;
+        let mut best_comparison = (0, 0);
+
+        const FAST_STATS_UPDATE_STRIDE: usize = 64;
+        for (idx, &(first, second, i, j, first_is_i_less_j)) in pairs.iter().enumerate() {
+            if idx % FAST_STATS_UPDATE_STRIDE == 0 {
+                self.analytics.update_stats(
+                    depth,
+                    self.current_max,
+                    self.cache.len(),
+                    self.cache.max_entries(),
+                );
+            }
+
+            let choose_i_less_j = self.heuristic_decision(
+                &poset,
+                first,
+                second,
+                i,
+                j,
+                first_is_i_less_j,
+                self.heuristic_strategy,
+            );
+
+            let chosen_poset = if choose_i_less_j == first_is_i_less_j {
+                first
+            } else {
+                second
+            };
+
+            let child_budget = current_best - 2;
+            if let Some(cached) = self.peek_cache(&chosen_poset) {
+                match cached {
+                    Cost::Solved(solved) => {
+                        if solved <= child_budget {
+                            best_comparison = (i, j);
+                            current_best = solved + 1;
+                        }
+                        self.analytics.inc(depth, 1);
+                        if current_best <= 1 {
+                            break;
+                        }
+                        continue;
+                    }
+                    Cost::Minimum(min) if min > child_budget => {
+                        self.analytics.inc(depth, 1);
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+
+            let result = self.search_heuristic_fast_rec(chosen_poset, child_budget, depth + 1);
+
+            if !result.is_solved() || result.value() > child_budget {
+                self.analytics.inc(depth, 1);
+                continue;
+            }
+
+            best_comparison = (i, j);
+            current_best = result.value() + 1;
+            self.analytics.inc(depth, 1);
+
+            if current_best <= 1 {
+                break;
+            }
+        }
+
+        let result = if current_best <= max_comparisons {
+            self.comparisons.insert(poset, best_comparison);
+            Cost::Solved(current_best)
+        } else {
+            Cost::Minimum(max_comparisons + 1)
+        };
+
+        self.analytics.inc_complete(depth, n_pairs);
+        self.analytics.record_poset();
+        self.insert_cache(poset, result);
+
+        result
+    }
+
+    /// Returns true for i < j, false for j < i
+    fn heuristic_decision(
+        &self,
+        parent: &PseudoCanonifiedPoset,
+        first: PseudoCanonifiedPoset,
+        second: PseudoCanonifiedPoset,
+        i: u8,
+        j: u8,
+        first_is_i_less_j: bool,
+        strategy: u8,
+    ) -> bool {
+        match strategy {
+            0 => self.heuristic_0_transitive_closure(parent, i, j),
+            1 => self.heuristic_1_hasse_edges(parent, i, j),
+            2 => self.heuristic_2_total_relations(first, second, first_is_i_less_j),
+            3 => self.heuristic_maximize_candidates(&first, &second, first_is_i_less_j),
+            4 => {
+                self.heuristic_maximize_compatible_rank_prefixes(&first, &second, first_is_i_less_j)
+            }
+            5 => self.heuristic_5_minimize_delta_downset_sum(parent, i, j),
+            6 => self.heuristic_6_fixed_i_less_j(),
+            _ => true,
+        }
+    }
+
+    /// Fixed baseline: always decide i < j.
+    #[inline]
+    fn heuristic_6_fixed_i_less_j(&self) -> bool {
+        true
+    }
+
+    fn heuristic_0_transitive_closure(&self, parent: &PseudoCanonifiedPoset, i: u8, j: u8) -> bool {
+        let upset_i = parent.get_all_greater_than(i).len();
+        let downset_j = parent.get_all_less_than(j).len();
+        let downset_i = parent.get_all_less_than(i).len();
+        let upset_j = parent.get_all_greater_than(j).len();
+
+        let impact_i_less_j = downset_i * upset_j;
+        let impact_j_less_i = downset_j * upset_i;
+
+        impact_i_less_j <= impact_j_less_i
+    }
+
+    fn count_hasse_upset_size(&self, poset: &PseudoCanonifiedPoset, i: u8) -> u32 {
+        let greater_than_i = poset.get_all_greater_than(i);
+        let mut count = 0;
+
+        for j in greater_than_i {
+            let j = j as u8;
+            let less_than_j = poset.get_all_less_than(j);
+            let intermediate = greater_than_i.intersect(less_than_j);
+
+            if intermediate.is_empty() {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn count_hasse_downset_size(&self, poset: &PseudoCanonifiedPoset, i: u8) -> u32 {
+        let less_than_i = poset.get_all_less_than(i);
+        let mut count = 0;
+
+        for j in less_than_i {
+            let j = j as u8;
+            let greater_than_j = poset.get_all_greater_than(j);
+            let intermediate = greater_than_j.intersect(less_than_i);
+
+            if intermediate.is_empty() {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    fn heuristic_1_hasse_edges(&self, parent: &PseudoCanonifiedPoset, i: u8, j: u8) -> bool {
+        let hasse_upset_i = self.count_hasse_upset_size(parent, i);
+        let hasse_downset_j = self.count_hasse_downset_size(parent, j);
+        let hasse_downset_i = self.count_hasse_downset_size(parent, i);
+        let hasse_upset_j = self.count_hasse_upset_size(parent, j);
+
+        let impact_i_less_j = hasse_downset_i * hasse_upset_j;
+        let impact_j_less_i = hasse_downset_j * hasse_upset_i;
+
+        impact_i_less_j <= impact_j_less_i
+    }
+
+    fn heuristic_2_total_relations(
+        &self,
+        a: PseudoCanonifiedPoset,
+        b: PseudoCanonifiedPoset,
+        first_is_i_less_j: bool,
+    ) -> bool {
+        let relations_a = self.count_total_relations(&a);
+        let relations_b = self.count_total_relations(&b);
+        if first_is_i_less_j {
+            relations_a <= relations_b
+        } else {
+            relations_b <= relations_a
+        }
+    }
+
+    fn heuristic_5_minimize_delta_downset_sum(
+        &self,
+        parent: &PseudoCanonifiedPoset,
+        i: u8,
+        j: u8,
+    ) -> bool {
+        let base = parent.to_free();
+        let s_parent = self.total_downset_sum(&base);
+
+        let mut i_less_j = base;
+        i_less_j.add_and_close(i, j);
+        let s_i_less_j = self.total_downset_sum(&i_less_j);
+
+        let mut j_less_i = base;
+        j_less_i.add_and_close(j, i);
+        let s_j_less_i = self.total_downset_sum(&j_less_i);
+
+        debug_assert!(s_i_less_j >= s_parent);
+        debug_assert!(s_j_less_i >= s_parent);
+
+        let delta_i_less_j = s_i_less_j - s_parent;
+        let delta_j_less_i = s_j_less_i - s_parent;
+
+        delta_i_less_j <= delta_j_less_i
+    }
+
+    fn count_total_relations(&self, poset: &PseudoCanonifiedPoset) -> u32 {
+        let n = poset.n() as usize;
+        let (less, greater) = poset.calculate_relations();
+        let mut total = 0;
+        for i in 0..n {
+            total += u32::from(less[i]) + u32::from(greater[i]);
+        }
+        total
+    }
+
+    fn total_downset_sum<P: Poset>(&self, poset: &P) -> u32 {
+        let (less, _) = poset.calculate_relations();
+        less[..poset.n() as usize]
+            .iter()
+            .map(|value| *value as u32)
+            .sum()
+    }
+
+    #[inline]
+    fn comparison_outcomes<'b>(
+        &self,
+        first: &'b PseudoCanonifiedPoset,
+        second: &'b PseudoCanonifiedPoset,
+        first_is_i_less_j: bool,
+    ) -> (&'b PseudoCanonifiedPoset, &'b PseudoCanonifiedPoset) {
+        if first_is_i_less_j {
+            (first, second)
+        } else {
+            (second, first)
+        }
+    }
+
+    fn heuristic_maximize_candidates(
+        &self,
+        first: &PseudoCanonifiedPoset,
+        second: &PseudoCanonifiedPoset,
+        first_is_i_less_j: bool,
+    ) -> bool {
+        let (i_less_j, j_less_i) = self.comparison_outcomes(first, second, first_is_i_less_j);
+
+        let candidates_i_less_j = self.count_rank_candidates(i_less_j);
+        let candidates_j_less_i = self.count_rank_candidates(j_less_i);
+
+        candidates_i_less_j >= candidates_j_less_i
+    }
+
+    fn count_rank_candidates(&self, poset: &PseudoCanonifiedPoset) -> u8 {
+        let (less, greater) = poset.calculate_relations();
+        self.count_candidates(&less, &greater, poset.n(), poset.i())
+    }
+
+    fn count_candidates(&self, less: &[u8], greater: &[u8], n: u8, rank: u8) -> u8 {
+        let max_larger = n.saturating_sub(rank.saturating_add(1));
+        let mut candidates = 0u8;
+
+        for i in 0..n as usize {
+            if less[i] <= rank && greater[i] <= max_larger {
+                candidates += 1;
+            }
+        }
+
+        candidates
+    }
+
+    fn heuristic_maximize_compatible_rank_prefixes(
+        &self,
+        first: &PseudoCanonifiedPoset,
+        second: &PseudoCanonifiedPoset,
+        first_is_i_less_j: bool,
+    ) -> bool {
+        let (i_less_j, j_less_i) = self.comparison_outcomes(first, second, first_is_i_less_j);
+
+        let count_ilj = self.count_compatible_rank_prefixes(i_less_j);
+        let count_jli = self.count_compatible_rank_prefixes(j_less_i);
+
+        count_ilj >= count_jli
+    }
+
+    fn count_compatible_rank_prefixes(&self, poset: &PseudoCanonifiedPoset) -> u64 {
+        let n = poset.n();
+        let target_len = poset.i() as usize + 1;
+
+        if target_len > n as usize {
+            return 0;
+        }
+
+        let (less, _) = poset.calculate_relations();
+        let greater_than: Vec<BitSet> = (0..n)
+            .map(|candidate| poset.get_all_greater_than(candidate))
+            .collect();
+        let mut memo = HashMap::new();
+
+        self.count_compatible_rank_prefixes_rec(
+            BitSet::empty(),
+            target_len,
+            &less[..n as usize],
+            &greater_than,
+            &mut memo,
+        )
+    }
+
+    fn count_compatible_rank_prefixes_rec(
+        &self,
+        chosen: BitSet,
+        target_len: usize,
+        less: &[u8],
+        greater_than: &[BitSet],
+        memo: &mut HashMap<BitSet, u64>,
+    ) -> u64 {
+        if chosen.len() == target_len {
+            return 1;
+        }
+
+        if let Some(&cached) = memo.get(&chosen) {
+            return cached;
+        }
+
+        let rank = chosen.len() as u8;
+        let mut count = 0u64;
+
+        for candidate in 0..less.len() {
+            if chosen.contains(candidate) {
+                continue;
+            }
+
+            if less[candidate] > rank {
+                continue;
+            }
+
+            if !greater_than[candidate].intersect(chosen).is_empty() {
+                continue;
+            }
+
+            let mut next_chosen = chosen;
+            next_chosen.insert(candidate);
+            count = count.saturating_add(self.count_compatible_rank_prefixes_rec(
+                next_chosen,
+                target_len,
+                less,
+                greater_than,
+                memo,
+            ));
+        }
+
+        memo.insert(chosen, count);
+        count
+    }
+
     pub fn print_cache(&self) {
-        // Print information about the cache
         println!("Cache entries: {}", self.cache.len());
         println!("Cache size: {:.3} Gigabyte", self.cache.size_as_gigabyte());
         println!("Cache hits: {}", self.analytics.cache_hits());
@@ -534,5 +1192,121 @@ impl Analytics {
 impl Drop for Analytics {
     fn drop(&mut self) {
         self.complete_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::free_poset::FreePoset;
+
+    fn run_heuristic(n: u8, i: u8, strategy: u8, fast: bool) -> u8 {
+        let mut cache = Cache::new(1 << 20);
+        let mut algorithm = HashMap::new();
+        let mut search = Search::new(
+            n,
+            i,
+            &mut cache,
+            &mut algorithm,
+            false,
+            WeightFunction::None,
+            strategy,
+        );
+
+        if fast {
+            search.search_heuristic_fast()
+        } else {
+            search.search_heuristic()
+        }
+    }
+
+    #[test]
+    fn heuristic_fast_matches_tracked_heuristic_on_nontrivial_instance() {
+        let n = 7;
+        let i = 2;
+
+        for strategy in 0..=6 {
+            let fast = run_heuristic(n, i, strategy, true);
+            let tracked = run_heuristic(n, i, strategy, false);
+
+            assert_eq!(
+                fast, tracked,
+                "mismatch for n={n}, i={i}, strategy={strategy}"
+            );
+        }
+    }
+
+    fn legacy_count_compatible_triples(poset: &PseudoCanonifiedPoset) -> u64 {
+        let n = poset.n();
+        let mut count = 0u64;
+
+        for m in 0..n {
+            if !poset.get_all_less_than(m).is_empty() {
+                continue;
+            }
+
+            for s in 0..n {
+                if s == m {
+                    continue;
+                }
+
+                if (s < m && poset.is_less(s, m)) || poset.get_all_less_than(s).len() > 1 {
+                    continue;
+                }
+
+                for t in 0..n {
+                    if t == m || t == s {
+                        continue;
+                    }
+
+                    if (t < m && poset.is_less(t, m))
+                        || (t < s && poset.is_less(t, s))
+                        || poset.get_all_less_than(t).len() > 2
+                    {
+                        continue;
+                    }
+
+                    count += 1;
+                }
+            }
+        }
+
+        count
+    }
+
+    #[test]
+    fn compatible_rank_prefix_count_matches_legacy_triples_for_i_2() {
+        let mut cache = Cache::new(1 << 20);
+        let mut algorithm = HashMap::new();
+        let search = Search::new(
+            6,
+            2,
+            &mut cache,
+            &mut algorithm,
+            false,
+            WeightFunction::None,
+            4,
+        );
+
+        let mut poset = FreePoset::new(6, 2);
+        poset.add_and_close(0, 2);
+        poset.add_and_close(1, 4);
+        let poset = poset.canonified();
+
+        assert_eq!(
+            search.count_compatible_rank_prefixes(&poset),
+            legacy_count_compatible_triples(&poset)
+        );
+    }
+
+    #[test]
+    fn heuristic_4_fast_matches_tracked_for_general_i() {
+        let n = 6;
+        let i = 1;
+
+        let fast = run_heuristic(n, i, 4, true);
+        let tracked = run_heuristic(n, i, 4, false);
+
+        assert_eq!(fast, tracked, "mismatch for n={n}, i={i}, strategy=4");
     }
 }

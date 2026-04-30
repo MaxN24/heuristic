@@ -9,10 +9,13 @@ use pseudo_canonified_poset::PseudoCanonifiedPoset;
 use search_backward::iterative_deepening_backward;
 use search_forward::Cost;
 use std::{
+    fs,
     fs::{DirBuilder, OpenOptions},
     io::{BufWriter, Write},
+    path::Path,
     str::FromStr,
     sync::{atomic::AtomicBool, Arc},
+    time::Instant,
 };
 
 use crate::{
@@ -37,11 +40,14 @@ mod search_backward;
 mod search_forward;
 mod utils;
 
+const HEURISTIC_RESULTS_HEADER: &str = "n,i,total_comparisons,elapsed_seconds";
+
 #[derive(Debug, Clone)]
 pub enum SearchMode {
     Forward,
     Backward,
     Bidirectional,
+    Heuristic,
 }
 
 impl FromStr for SearchMode {
@@ -52,6 +58,7 @@ impl FromStr for SearchMode {
             "forward" => Ok(SearchMode::Forward),
             "backward" => Ok(SearchMode::Backward),
             "bidirectional" => Ok(SearchMode::Bidirectional),
+            "heuristic" => Ok(SearchMode::Heuristic),
             _ => Err(Error::new(ErrorKind::InvalidValue)),
         }
     }
@@ -110,6 +117,12 @@ struct Args {
     /// Weight function to use for forward search
     #[arg(long, default_value = "w")]
     weight_function: WeightFunction,
+    /// The heuristic strategy to use
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=6))]
+    heuristic_strategy: u8,
+    /// Use the fast heuristic search
+    #[arg(long, default_value_t = false)]
+    heuristic_fast: bool,
 }
 
 fn main() {
@@ -136,6 +149,122 @@ fn main() {
     match args.search_mode {
         SearchMode::Forward | SearchMode::Bidirectional => run_forward(&args),
         SearchMode::Backward => run_backward(&args),
+        SearchMode::Heuristic => run_heuristic(&args),
+    }
+}
+
+fn run_heuristic(args: &Args) {
+    let start_n = args.n.unwrap_or(1);
+
+    let mut cache = Cache::new(args.max_cache_size);
+    let mut algorithm = HashMap::new();
+
+    let mode = if args.heuristic_fast {
+        "fast"
+    } else {
+        "tracked"
+    };
+    let log_dir = format!("logs/heuristic/strategy_{}/{mode}", args.heuristic_strategy);
+    let results_path = format!("{log_dir}/results.csv");
+
+    println!("Cache entries: {}", cache.len());
+    println!("Maximum cache entries: {}", cache.max_entries());
+
+    DirBuilder::new().recursive(true).create(&log_dir).unwrap();
+    ensure_heuristic_results_file(&results_path);
+
+    for n in start_n..=MAX_N as u8 {
+        let start_i = if n == start_n { args.i.unwrap_or(0) } else { 0 };
+
+        for i in start_i..(n + 1) / 2 {
+            let mut search = Search::new(
+                n,
+                i,
+                &mut cache,
+                &mut algorithm,
+                false,
+                args.weight_function,
+                args.heuristic_strategy,
+            );
+
+            let search_start = Instant::now();
+            let result = if args.heuristic_fast {
+                search.search_heuristic_fast()
+            } else {
+                search.search_heuristic()
+            };
+            let elapsed_seconds = search_start.elapsed().as_secs_f64();
+
+            println!(
+                "n: {n}, i: {i}, total comparisons: {result}, elapsed seconds: {elapsed_seconds:.6}"
+            );
+
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&results_path)
+                .unwrap();
+
+            let mut writer = BufWriter::new(file);
+            writeln!(writer, "{n},{i},{result},{elapsed_seconds:.6}").unwrap();
+
+            if args.single {
+                return;
+            }
+        }
+    }
+}
+
+fn ensure_heuristic_results_file(results_path: &str) {
+    if !Path::new(results_path).exists() {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(results_path)
+            .unwrap();
+
+        let mut writer = BufWriter::new(file);
+        writeln!(writer, "{HEURISTIC_RESULTS_HEADER}").unwrap();
+        return;
+    }
+
+    let contents = fs::read_to_string(results_path).unwrap();
+    let Some(header) = contents.lines().next() else {
+        let file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(results_path)
+            .unwrap();
+
+        let mut writer = BufWriter::new(file);
+        writeln!(writer, "{HEURISTIC_RESULTS_HEADER}").unwrap();
+        return;
+    };
+
+    if header == HEURISTIC_RESULTS_HEADER {
+        return;
+    }
+
+    assert_eq!(
+        header, "n,i,total_comparisons",
+        "unexpected heuristic results header in {results_path}"
+    );
+
+    let file = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(results_path)
+        .unwrap();
+    let mut writer = BufWriter::new(file);
+    writeln!(writer, "{HEURISTIC_RESULTS_HEADER}").unwrap();
+
+    for line in contents.lines().skip(1) {
+        if line.trim().is_empty() {
+            writeln!(writer).unwrap();
+        } else {
+            writeln!(writer, "{line},").unwrap();
+        }
     }
 }
 
@@ -153,8 +282,16 @@ fn run_forward(args: &Args) {
         let start_i = if n == start_n { args.i.unwrap_or(0) } else { 0 };
 
         for i in start_i..(n + 1) / 2 {
-            let result =
-                Search::new(n, i, &mut cache, &mut algorithm, use_bidirectional_search, args.weight_function).search();
+            let result = Search::new(
+                n,
+                i,
+                &mut cache,
+                &mut algorithm,
+                use_bidirectional_search,
+                args.weight_function,
+                args.heuristic_strategy,
+            )
+            .search();
 
             if (n as usize) < KNOWN_VALUES.len() && (i as usize) < KNOWN_VALUES[n as usize].len() {
                 assert_eq!(result, KNOWN_VALUES[n as usize][i as usize] as u8);
@@ -269,8 +406,9 @@ fn print_algorithm<W>(
 where
     W: Write,
 {
-    const VARIABLES: [&str; MAX_N] = [
-        "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p",
+    const VARIABLES: [&str; 32] = [
+        "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r",
+        "s", "t", "u", "v", "w", "x", "y", "z", "A", "B", "C", "D", "E", "F",
     ];
 
     if let Some(index) = done.get(&poset) {
@@ -455,8 +593,9 @@ fn print_algorithm_backward<W>(
 where
     W: Write,
 {
-    const VARIABLES: [&str; MAX_N] = [
-        "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p",
+    const VARIABLES: [&str; 32] = [
+        "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r",
+        "s", "t", "u", "v", "w", "x", "y", "z", "A", "B", "C", "D", "E", "F",
     ];
 
     if let Some(index) = done.get(&poset) {

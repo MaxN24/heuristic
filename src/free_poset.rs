@@ -141,6 +141,32 @@ impl FreePoset {
         canonified
     }
 
+    /// Canonifies the poset and returns both the canonified version and the mapping from reduced indices to original indices
+    pub fn canonified_with_mapping(&self) -> (PseudoCanonifiedPoset, Vec<u8>) {
+        let mut copy = *self;
+        let reduce_map = copy.reduce_elements();
+        let canon_map = copy.get_canonification_mapping();
+
+        let mut canonified = PseudoCanonifiedPoset::new(copy.n, copy.i);
+
+        for i in 0..canonified.n() {
+            let mapped_i = canon_map[i as usize] as u8;
+            for j in (i + 1)..canonified.n() {
+                if copy.is_less(mapped_i, canon_map[j as usize] as u8) {
+                    canonified.set_is_less(i, j);
+                }
+            }
+        }
+
+        // Compose the two mappings: canonical index -> reduced index -> original index
+        let mut combined_map = Vec::with_capacity(copy.n as usize);
+        for i in 0..copy.n as usize {
+            combined_map.push(reduce_map[canon_map[i]] as u8);
+        }
+
+        (canonified, combined_map)
+    }
+
     #[allow(unused)]
     #[inline]
     pub fn canonify(&mut self) {

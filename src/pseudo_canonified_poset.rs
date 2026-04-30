@@ -1,7 +1,11 @@
 use core::fmt::Debug;
+use hashbrown::HashSet;
 
 use crate::{
-    backwards_poset::BackwardsPoset, bitset::BitSet, constants::MAX_N, free_poset::FreePoset,
+    backwards_poset::BackwardsPoset,
+    bitset::{BitSet, BitStorage},
+    constants::MAX_N,
+    free_poset::FreePoset,
     poset::Poset,
 };
 
@@ -42,7 +46,13 @@ impl Poset for PseudoCanonifiedPoset {
 
     #[inline]
     fn has_order(&self, i: u8, j: u8) -> bool {
-        self.is_less(i, j)
+        if i < j {
+            self.is_less(i, j)
+        } else if j < i {
+            self.is_less(j, i)
+        } else {
+            false
+        }
     }
 
     #[inline]
@@ -53,9 +63,9 @@ impl Poset for PseudoCanonifiedPoset {
             let mut i = 0;
             while i < MAX_N {
                 masks[i] = if i < MAX_N / 2 + 1 {
-                    BitSet::from_u16((((1u32 << (MAX_N - i + 1)) - 1) as u16) << (i + 1))
+                    BitSet::from_storage((((1u64 << (MAX_N - i + 1)) - 1) as BitStorage) << (i + 1))
                 } else {
-                    BitSet::from_u16(((1u32 << (MAX_N - i + 1)) - 1) as u16)
+                    BitSet::from_storage(((1u64 << (MAX_N - i + 1)) - 1) as BitStorage)
                 };
                 i += 1;
             }
@@ -71,7 +81,8 @@ impl Poset for PseudoCanonifiedPoset {
             self.adjacency[row].intersect(mask)
         } else {
             let row = MAX_N - i;
-            (self.adjacency[row].intersect(mask).bits() << (i + 1)).into()
+            let bits = self.adjacency[row].intersect(mask).bits() as u64;
+            ((bits << (i + 1)) as BitStorage).into()
         }
     }
 
@@ -170,10 +181,12 @@ impl PseudoCanonifiedPoset {
         result
     }
 
+    /// Returns comparison pairs with metadata about which poset is which.
     pub fn get_comparison_pairs(
         &self,
-    ) -> Vec<(PseudoCanonifiedPoset, PseudoCanonifiedPoset, u8, u8)> {
+    ) -> Vec<(PseudoCanonifiedPoset, PseudoCanonifiedPoset, u8, u8, bool)> {
         let mut pairs = Vec::with_capacity(self.n() as usize * (self.n() as usize - 1) / 2);
+        let mut seen = HashSet::with_capacity(pairs.capacity());
 
         for i in 0..self.n() {
             for j in (i + 1)..self.n() {
@@ -187,21 +200,14 @@ impl PseudoCanonifiedPoset {
                 let hardness_less = less.estimate_hardness();
                 let hardness_greater = greater.estimate_hardness();
 
+                // first_is_i_less_j indicates whether 'first' in the tuple is the i<j poset
                 let pair = if hardness_less < hardness_greater {
-                    (less, greater, i, j, hardness_greater)
+                    (less, greater, i, j, hardness_greater, true) // first=less=i<j
                 } else {
-                    (greater, less, i, j, hardness_less)
+                    (greater, less, i, j, hardness_less, false) // first=greater=j<i
                 };
 
-                if pairs
-                    .iter()
-                    .find(
-                        |e: &&(PseudoCanonifiedPoset, PseudoCanonifiedPoset, u8, u8, u32)| {
-                            e.0 == pair.0 && e.1 == pair.1
-                        },
-                    )
-                    .is_none()
-                {
+                if seen.insert((pair.0, pair.1)) {
                     pairs.push(pair);
                 }
             }
@@ -211,7 +217,7 @@ impl PseudoCanonifiedPoset {
 
         pairs
             .into_iter()
-            .map(|(a, b, c, d, _)| (a, b, c, d))
+            .map(|(a, b, c, d, _, first_is_i_less_j)| (a, b, c, d, first_is_i_less_j))
             .collect()
     }
 }

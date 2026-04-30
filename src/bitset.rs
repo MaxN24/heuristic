@@ -2,10 +2,12 @@ use std::fmt::Debug;
 
 use crate::constants::MAX_N;
 
+pub type BitStorage = u32;
+
 /// A bitset to store up to `MAX_N` bits
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct BitSet {
-    bits: u16,
+    bits: BitStorage,
 }
 
 impl BitSet {
@@ -15,12 +17,25 @@ impl BitSet {
     }
 
     #[inline]
-    pub const fn from_u16(bits: u16) -> Self {
+    pub const fn from_storage(bits: BitStorage) -> Self {
         BitSet { bits }
     }
 
     #[inline]
-    pub const fn bits(self) -> u16 {
+    pub const fn full_up_to(len: usize) -> Self {
+        if len == 0 {
+            return BitSet::empty();
+        }
+
+        if len >= BitStorage::BITS as usize {
+            return BitSet::from_storage(BitStorage::MAX);
+        }
+
+        BitSet::from_storage(((1u64 << len) - 1) as BitStorage)
+    }
+
+    #[inline]
+    pub const fn bits(self) -> BitStorage {
         self.bits
     }
 
@@ -37,7 +52,7 @@ impl BitSet {
 
     #[inline]
     pub fn insert(&mut self, index: usize) {
-        debug_assert!(index <= MAX_N);
+        debug_assert!(index < MAX_N);
         let bit_mask = 1 << index;
 
         self.bits |= bit_mask;
@@ -45,7 +60,7 @@ impl BitSet {
 
     #[inline]
     pub fn remove(&mut self, index: usize) {
-        debug_assert!(index <= MAX_N);
+        debug_assert!(index < MAX_N);
         let bit_mask = 1 << index;
 
         self.bits &= !bit_mask;
@@ -53,7 +68,7 @@ impl BitSet {
 
     #[inline]
     pub const fn contains(self, index: usize) -> bool {
-        debug_assert!(index <= MAX_N);
+        debug_assert!(index < MAX_N);
         let bit_mask = 1 << index;
 
         (self.bits & bit_mask) != 0
@@ -75,7 +90,11 @@ impl BitSet {
 
     #[inline]
     pub const fn complement(self) -> Self {
-        const MASK: u16 = ((1u32 << (MAX_N + 1)) - 1) as u16;
+        const MASK: BitStorage = if MAX_N >= BitStorage::BITS as usize {
+            BitStorage::MAX
+        } else {
+            ((1u64 << MAX_N) - 1) as BitStorage
+        };
         BitSet {
             bits: !self.bits & MASK,
         }
@@ -102,10 +121,10 @@ impl IntoIterator for BitSet {
     }
 }
 
-impl From<u16> for BitSet {
+impl From<BitStorage> for BitSet {
     #[inline]
-    fn from(bits: u16) -> Self {
-        Self::from_u16(bits)
+    fn from(bits: BitStorage) -> Self {
+        Self::from_storage(bits)
     }
 }
 
@@ -147,12 +166,23 @@ impl Debug for BitSet {
         f.debug_struct("BitSet")
             .field(
                 "bits",
-                &format!("{:016b}", self.bits).chars().collect::<String>(),
+                &format!("{:032b}", self.bits).chars().collect::<String>(),
             )
             .field(
                 "set_bits",
                 &(0..MAX_N).filter(|i| self.contains(*i)).collect::<Vec<_>>(),
             )
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_up_to_handles_32_bits() {
+        let full = BitSet::full_up_to(MAX_N);
+        assert_eq!(full.bits(), BitStorage::MAX);
     }
 }
